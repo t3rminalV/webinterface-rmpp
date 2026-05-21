@@ -19,7 +19,7 @@
 
 set -eu
 
-WEBINT_RMPP_VERSION='0.9.0'
+WEBINT_RMPP_VERSION='1.0.0'
 
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 

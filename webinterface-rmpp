@@ -8,7 +8,7 @@
 
 set -u
 
-WEBINT_RMPP_VERSION='0.9.0'
+WEBINT_RMPP_VERSION='1.0.0'
 
 # --- paths ---------------------------------------------------------------
 NETWORKD_DROPIN='/etc/systemd/network/05-webinterface-alwayson.network'

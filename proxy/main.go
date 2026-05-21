@@ -36,7 +36,7 @@ import (
 	"time"
 )
 
-const version = "0.9.0"
+const version = "1.0.0"
 
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
