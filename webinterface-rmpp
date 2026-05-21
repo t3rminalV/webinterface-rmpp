@@ -1,0 +1,600 @@
+#!/usr/bin/env bash
+# webinterface-rmpp -- always-on USB web interface + wifi proxy
+# (with HTTP basic auth) for the reMarkable Paper Pro.
+#
+# SPDX-License-Identifier: MIT
+#
+# Installed at /home/root/.local/bin/webinterface-rmpp by install.sh.
+
+set -u
+
+WEBINT_RMPP_VERSION='0.9.0'
+
+# --- paths ---------------------------------------------------------------
+NETWORKD_DROPIN='/etc/systemd/network/05-webinterface-alwayson.network'
+WIFI_SERVICE_UNIT='/etc/systemd/system/webinterface-wifi.service'
+WIFI_PROXY_BIN='/home/root/.local/bin/webinterface-wifi-proxy'
+CONFIG_DIR='/home/root/.config/webinterface-rmpp'
+WIFI_ENV="${CONFIG_DIR}/wifi.env"
+TLS_DIR="${CONFIG_DIR}/tls"
+TLS_CERT="${TLS_DIR}/cert.pem"
+TLS_KEY="${TLS_DIR}/key.pem"
+XOCHITL_CONF='/home/root/.config/remarkable/xochitl.conf'
+TARGET_IP='10.11.99.1'
+
+# --- colours -------------------------------------------------------------
+RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
+CYAN=$'\033[0;36m'; PURPLE=$'\033[0;35m'; NC=$'\033[0m'
+
+# --- helpers -------------------------------------------------------------
+err()  { printf '%s\n' "$*" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+remount_rw() {
+	mount -o remount,rw / 2>/dev/null \
+		|| { err "${RED}error:${NC} could not remount / read-write"; return 1; }
+}
+remount_ro() { mount -o remount,ro / 2>/dev/null || true; }
+
+require_root() {
+	if [ "$(id -u)" -ne 0 ]; then
+		err "${RED}error:${NC} must be run as root"
+		exit 1
+	fi
+}
+
+env_get() {
+	# fetch KEY from $WIFI_ENV (simple KEY=VALUE format, no quoting)
+	[ -f "$WIFI_ENV" ] || return 0
+	awk -F= -v k="$1" '$1==k { sub(/^[^=]*=/, ""); print; exit }' "$WIFI_ENV"
+}
+
+wlan_ip() {
+	# First IPv4 on wlan0, or empty if none. Avoid `ip -o` so this works
+	# under BusyBox `ip` as well as iproute2.
+	ip -4 addr show dev wlan0 2>/dev/null \
+		| awk '/inet /{print $2; exit}' | cut -d/ -f1
+}
+usb1_has_target_ip() {
+	ip -4 addr show dev usb1 2>/dev/null | grep -q "${TARGET_IP}/"
+}
+webint_listening() {
+	netstat -tln 2>/dev/null | grep -qE "${TARGET_IP}:80[[:space:]]+.*LISTEN"
+}
+
+# --- commands ------------------------------------------------------------
+cmd_help() {
+	cat <<EOF
+${GREEN}webinterface-rmpp ${WEBINT_RMPP_VERSION}${NC}
+
+Keeps the reMarkable Paper Pro's USB web interface available without a
+cable plugged in, and exposes it on the wifi network behind HTTP basic
+authentication.
+
+${CYAN}USAGE${NC}
+  webinterface-rmpp <command>
+
+${CYAN}COMMANDS${NC}
+  status              Show status of all components
+  ensure              Re-assert WebInterfaceEnabled=true and reload networkd
+  logs [-n N] [-f]    Tail journalctl for the wifi proxy (default N=50)
+  diag                Print a self-contained debug report (mounts, units,
+                      configs, cert, listening ports, journal lines)
+  enable-wifi         Enable + start the wifi proxy
+  disable-wifi        Stop + disable the wifi proxy
+  restart-wifi        Restart the wifi proxy (e.g. after editing wifi.env)
+  set-wifi-port <n>   Change listen port and restart proxy
+  set-wifi-auth       Interactively (re)set the proxy username/password
+  show-wifi-auth      Print the current proxy username (not the password)
+  regen-cert [SAN..]  Re-generate the self-signed cert with current SANs
+  show-cert           Print fingerprint / validity / SANs of the cert
+  print-trust-snippet Print copy-paste commands to trust the cert on
+                      your laptop (macOS / Linux / Windows / iOS)
+  is-alwayson         Exit 0 if the networkd drop-in is installed, else 1
+  is-wifi-enabled     Exit 0 if the wifi proxy is enabled, else 1
+  version             Print version
+  help, -h, --help    Show this help
+
+${CYAN}FILES${NC}
+  ${WIFI_ENV}
+      LISTEN_ADDR, TARGET, AUTH_USER, AUTH_PASS,
+      TLS_CERT, TLS_KEY (mode 0600)
+  ${TLS_DIR}/ (cert.pem mode 0644, key.pem mode 0600)
+  ${WIFI_SERVICE_UNIT}
+  ${NETWORKD_DROPIN}
+
+${CYAN}NOTES${NC}
+  * TLS uses a self-signed cert generated at install time. Browsers
+    warn on first visit -- verify the fingerprint from 'show-cert'
+    matches what your browser shows, then trust/accept.
+  * Firmware updates may reset the system partition; re-run install.sh
+    after a firmware update to restore the unit + drop-in. Your cert,
+    key, and credentials in /home survive the update.
+
+EOF
+}
+
+cmd_version() { echo "$WEBINT_RMPP_VERSION"; }
+
+cmd_status() {
+	echo -e "${CYAN}[${NC}USB WEB INTERFACE${CYAN}]${NC}"
+	if webint_listening; then
+		echo -e "  ${GREEN}listening${NC} on ${TARGET_IP}:80"
+	else
+		echo -e "  ${RED}not listening${NC} on ${TARGET_IP}:80"
+	fi
+
+	echo
+	echo -e "${CYAN}[${NC}usb1 ADDRESS${CYAN}]${NC}"
+	if usb1_has_target_ip; then
+		echo -e "  ${GREEN}${TARGET_IP}${NC} is configured on usb1"
+	else
+		echo -e "  ${YELLOW}${TARGET_IP}${NC} not on usb1 -- web interface will not run"
+	fi
+
+	echo
+	echo -e "${CYAN}[${NC}ALWAYS-ON DROP-IN${CYAN}]${NC}"
+	if [ -f "$NETWORKD_DROPIN" ]; then
+		echo -e "  ${GREEN}installed${NC}: ${NETWORKD_DROPIN}"
+		if grep -q '^ConfigureWithoutCarrier=yes' "$NETWORKD_DROPIN" \
+		   && grep -q '^IgnoreCarrierLoss=yes' "$NETWORKD_DROPIN" \
+		   && grep -q '^DHCPServer=yes' "$NETWORKD_DROPIN"; then
+			echo "  directives: ok"
+		else
+			echo -e "  ${YELLOW}warning${NC}: drop-in is missing expected directives"
+		fi
+	else
+		echo -e "  ${RED}not installed${NC} -- run install.sh"
+	fi
+
+	echo
+	echo -e "${CYAN}[${NC}xochitl.conf${CYAN}]${NC}"
+	if [ -f "$XOCHITL_CONF" ]; then
+		val=$(awk -F= '/^WebInterfaceEnabled=/{print $2; exit}' "$XOCHITL_CONF")
+		case "$val" in
+			true)  echo -e "  WebInterfaceEnabled=${GREEN}true${NC}" ;;
+			false) echo -e "  WebInterfaceEnabled=${RED}false${NC} -- run 'webinterface-rmpp ensure'" ;;
+			'')    echo -e "  WebInterfaceEnabled ${YELLOW}absent${NC} -- run 'webinterface-rmpp ensure'" ;;
+			*)     echo -e "  WebInterfaceEnabled=${YELLOW}${val}${NC} (unexpected)" ;;
+		esac
+	else
+		echo -e "  ${RED}${XOCHITL_CONF} not found${NC}"
+	fi
+
+	echo
+	echo -e "${CYAN}[${NC}WIFI PROXY${CYAN}]${NC}"
+	if [ ! -f "$WIFI_SERVICE_UNIT" ] || [ ! -x "$WIFI_PROXY_BIN" ] || [ ! -f "$WIFI_ENV" ]; then
+		echo -e "  ${YELLOW}not installed${NC} -- run install.sh"
+	else
+		listen=$(env_get LISTEN_ADDR)
+		user=$(env_get AUTH_USER)
+		pass=$(env_get AUTH_PASS)
+		cert=$(env_get TLS_CERT)
+		key=$(env_get TLS_KEY)
+		echo "  unit:    ${WIFI_SERVICE_UNIT}"
+		echo "  binary:  ${WIFI_PROXY_BIN}"
+		echo "  listen:  ${listen:-<unset>}"
+		echo "  user:    ${user:-<unset>}"
+		if [ -z "$pass" ]; then
+			echo -e "  password:${RED}<unset>${NC} -- proxy will refuse to start"
+		else
+			echo "  password: <set>"
+		fi
+		if [ -n "$cert" ] && [ -f "$cert" ] && [ -n "$key" ] && [ -f "$key" ]; then
+			echo -e "  cert:    ${GREEN}${cert}${NC}"
+			# Days remaining: show-cert prints "not after: 2036-05-19T..."
+			# We can compute the delta using date parsing.
+			if [ -x "$WIFI_PROXY_BIN" ]; then
+				notafter=$("$WIFI_PROXY_BIN" show-cert --cert "$cert" 2>/dev/null \
+					| awk '/^not after:/{print $3; exit}')
+				if [ -n "$notafter" ]; then
+					expiry_epoch=$(date -d "$notafter" +%s 2>/dev/null \
+						|| date -j -f '%Y-%m-%dT%H:%M:%SZ' "$notafter" +%s 2>/dev/null)
+					now_epoch=$(date +%s)
+					if [ -n "$expiry_epoch" ]; then
+						days=$(( (expiry_epoch - now_epoch) / 86400 ))
+						if [ $days -lt 0 ]; then
+							echo -e "  expires: ${RED}EXPIRED ${days#-} days ago${NC} -- run 'regen-cert'"
+						elif [ $days -lt 30 ]; then
+							echo -e "  expires: ${YELLOW}in ${days} days${NC} -- run 'regen-cert' soon"
+						else
+							echo "  expires: in ${days} days"
+						fi
+					fi
+				fi
+			fi
+		else
+			echo -e "  cert:    ${RED}${cert:-<unset>} -- missing (proxy will refuse to start)${NC}"
+		fi
+		if systemctl --quiet is-enabled webinterface-wifi.service 2>/dev/null; then
+			echo -e "  enabled: ${GREEN}yes${NC}"
+		else
+			echo -e "  enabled: ${YELLOW}no${NC}"
+		fi
+		if systemctl --quiet is-active webinterface-wifi.service 2>/dev/null; then
+			echo -e "  active:  ${GREEN}yes${NC}"
+		else
+			echo -e "  active:  ${YELLOW}no${NC}"
+		fi
+		wip=$(wlan_ip)
+		port=${listen##*:}
+		portsuffix=":${port}"
+		[ "$port" = 443 ] && portsuffix=''
+		if [ -n "$wip" ] && [ -n "$port" ]; then
+			echo -e "  reachable at: ${PURPLE}https://${wip}${portsuffix}/${NC}"
+		elif [ -z "$wip" ]; then
+			echo -e "  ${YELLOW}wlan0 has no IPv4 address${NC}"
+		fi
+	fi
+
+	echo
+	echo -e "${CYAN}[${NC}SECURITY${CYAN}]${NC}"
+	echo "  HTTPS with self-signed cert + HTTP basic auth."
+	echo "  Run 'webinterface-rmpp show-cert' to see the SHA-256 fingerprint;"
+	echo "  verify it on first browser visit before trusting the cert."
+}
+
+cmd_ensure() {
+	require_root
+	if [ ! -f "$XOCHITL_CONF" ]; then
+		err "${RED}error:${NC} ${XOCHITL_CONF} not found"
+		exit 1
+	fi
+	if grep -q '^WebInterfaceEnabled=' "$XOCHITL_CONF"; then
+		sed -i 's/^WebInterfaceEnabled=.*/WebInterfaceEnabled=true/' "$XOCHITL_CONF"
+	elif grep -q '^\[General\]' "$XOCHITL_CONF"; then
+		sed -i '/^\[General\]/a WebInterfaceEnabled=true' "$XOCHITL_CONF"
+	else
+		printf '\n[General]\nWebInterfaceEnabled=true\n' >> "$XOCHITL_CONF"
+	fi
+	echo "WebInterfaceEnabled=true in ${XOCHITL_CONF}"
+	if [ -f "$NETWORKD_DROPIN" ]; then
+		networkctl reload 2>/dev/null || true
+		networkctl reconfigure usb1 >/dev/null 2>&1 || true
+		echo "networkd reloaded; usb1 reconfigured"
+	else
+		err "${YELLOW}warn:${NC}  ${NETWORKD_DROPIN} missing -- run install.sh"
+	fi
+	if ! webint_listening; then
+		echo -e "${YELLOW}note:${NC} web interface not yet listening; you may need to"
+		echo "      restart xochitl once: systemctl restart xochitl"
+	fi
+}
+
+cmd_enable_wifi() {
+	require_root
+	if [ ! -f "$WIFI_SERVICE_UNIT" ]; then
+		err "${RED}error:${NC} wifi proxy not installed -- run install.sh"
+		exit 1
+	fi
+	if [ ! -f "$WIFI_ENV" ] || [ -z "$(env_get AUTH_PASS)" ]; then
+		err "${RED}error:${NC} ${WIFI_ENV} missing or has no AUTH_PASS"
+		err "       run: webinterface-rmpp set-wifi-auth"
+		exit 1
+	fi
+	remount_rw || exit 1
+	trap 'remount_ro' EXIT
+	systemctl enable webinterface-wifi.service
+	remount_ro
+	trap - EXIT
+	systemctl restart webinterface-wifi.service
+	user=$(env_get AUTH_USER)
+	wip=$(wlan_ip)
+	listen=$(env_get LISTEN_ADDR)
+	port=${listen##*:}
+	echo "enabled webinterface-wifi.service (user=${user})"
+	[ -n "$wip" ] && echo "  http://${wip}:${port}/"
+}
+
+cmd_disable_wifi() {
+	require_root
+	systemctl stop webinterface-wifi.service 2>/dev/null || true
+	remount_rw || exit 1
+	trap 'remount_ro' EXIT
+	systemctl disable webinterface-wifi.service 2>/dev/null || true
+	remount_ro
+	trap - EXIT
+	echo "disabled webinterface-wifi.service"
+}
+
+cmd_regen_cert() {
+	require_root
+	if [ ! -x "$WIFI_PROXY_BIN" ]; then
+		err "${RED}error:${NC} ${WIFI_PROXY_BIN} missing -- run install.sh"; exit 1
+	fi
+	mkdir -p "$TLS_DIR"
+	local host wlan san extra
+	host=$(hostname 2>/dev/null || echo rmpp)
+	wlan=$(wlan_ip)
+	san="${host},${host}.local,localhost,remarkable.local,127.0.0.1,${TARGET_IP}"
+	[ -n "$wlan" ] && san="${san},${wlan}"
+	# Append any extra SANs from positional args (comma-separated).
+	for extra in "$@"; do
+		[ -n "$extra" ] && san="${san},${extra}"
+	done
+	echo "regenerating cert with SAN: ${san}"
+	"$WIFI_PROXY_BIN" gen-cert \
+		--cert "$TLS_CERT" --key "$TLS_KEY" \
+		--san "$san" --days 3650 \
+		--cn "reMarkable Paper Pro (${host})"
+	chmod 0644 "$TLS_CERT"
+	chmod 0600 "$TLS_KEY"
+	if systemctl --quiet is-active webinterface-wifi.service 2>/dev/null; then
+		systemctl restart webinterface-wifi.service
+		echo "proxy restarted with new cert"
+	fi
+}
+
+cmd_show_cert() {
+	if [ ! -f "$TLS_CERT" ]; then
+		echo "no certificate at ${TLS_CERT}"; exit 1
+	fi
+	if [ ! -x "$WIFI_PROXY_BIN" ]; then
+		err "${RED}error:${NC} ${WIFI_PROXY_BIN} missing"; exit 1
+	fi
+	"$WIFI_PROXY_BIN" show-cert --cert "$TLS_CERT"
+}
+
+cmd_logs() {
+	# webinterface-rmpp logs [-n N] [-f]
+	local n=50 follow=0
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-n) n="${2:-50}"; shift 2 ;;
+			-f|--follow) follow=1; shift ;;
+			-h|--help)
+				echo "usage: webinterface-rmpp logs [-n N] [-f]"
+				echo "  -n N    show last N lines (default 50)"
+				echo "  -f      follow (tail)"
+				exit 0 ;;
+			*) err "unknown arg: $1"; exit 2 ;;
+		esac
+	done
+	if [ $follow -eq 1 ]; then
+		exec journalctl -u webinterface-wifi.service -n "$n" --no-pager -f
+	else
+		exec journalctl -u webinterface-wifi.service -n "$n" --no-pager
+	fi
+}
+
+cmd_diag() {
+	# All read-only. Output is meant to be redirected/scped if needed.
+	# AUTH_PASS is redacted; AUTH_USER is shown.
+	local now host
+	now=$(date -u +%FT%TZ 2>/dev/null || date)
+	host=$(hostname 2>/dev/null || echo '?')
+
+	hr() { echo "=== $* ==="; }
+
+	hr "webinterface-rmpp diag ${WEBINT_RMPP_VERSION}  (${now})"
+	echo "host: ${host}"
+	uname -a 2>/dev/null
+	echo
+
+	hr "install-state"
+	cat /home/root/.local/share/webinterface-rmpp/install-state 2>&1
+	echo
+
+	hr "mount / and /etc"
+	mount | grep -E ' / | /etc'
+	echo
+
+	hr "networkd configs (overlay view)"
+	ls -la /etc/systemd/network/ 2>&1
+	for f in /etc/systemd/network/*.network /etc/systemd/network/*.network.d/*.conf; do
+		[ -f "$f" ] || continue
+		echo "--- $f ---"
+		cat "$f"
+	done
+	echo
+
+	hr "usb interfaces"
+	ip -br addr show dev usb0 usb1 2>&1
+	for i in usb0 usb1; do
+		echo "  ${i}: carrier=$(cat /sys/class/net/$i/carrier 2>/dev/null) operstate=$(cat /sys/class/net/$i/operstate 2>/dev/null)"
+	done
+	echo
+
+	hr "networkctl status usb1"
+	networkctl status usb1 2>&1 | head -30
+	echo
+
+	hr "xochitl.conf WebInterface*"
+	grep -i webinterface "$XOCHITL_CONF" 2>&1
+	echo
+
+	hr "wifi proxy: unit + env (AUTH_PASS redacted)"
+	systemctl --no-pager --full status webinterface-wifi.service 2>&1 | head -20
+	if [ -f "$WIFI_ENV" ]; then
+		echo "--- ${WIFI_ENV} ---"
+		sed 's/^AUTH_PASS=.*/AUTH_PASS=<redacted>/' "$WIFI_ENV"
+	else
+		echo "(${WIFI_ENV} missing)"
+	fi
+	echo
+
+	hr "certificate"
+	if [ -f "$TLS_CERT" ] && [ -x "$WIFI_PROXY_BIN" ]; then
+		"$WIFI_PROXY_BIN" show-cert --cert "$TLS_CERT" 2>&1
+	else
+		echo "(no cert at ${TLS_CERT})"
+	fi
+	echo
+
+	hr "listening ports on :80 and the wifi port"
+	netstat -tln 2>/dev/null | awk 'NR==1 || /:(80|443|8080|8443)[[:space:]]/'
+	echo
+
+	hr "last 50 lines: webinterface-wifi.service"
+	journalctl -u webinterface-wifi.service -n 50 --no-pager 2>&1 | tail -50
+	echo
+
+	hr "last 30 lines: systemd-networkd"
+	journalctl -u systemd-networkd -n 30 --no-pager 2>&1 | tail -30
+}
+
+cmd_print_trust_snippet() {
+	# Print copy-paste snippets the user can run on their laptop to trust
+	# the device's self-signed cert. We can't know the user's laptop OS, so
+	# print snippets for all reasonable targets, replacing <PAPER-PRO-IP>.
+	local fp
+	fp=$(cmd_show_cert 2>/dev/null | awk '/^SHA-256:/{print $2}')
+	if [ -z "$fp" ]; then fp='<run show-cert to fetch>'; fi
+
+	cat <<EOF
+${GREEN}Trust the device's self-signed cert on your laptop${NC}
+
+Cert fingerprint (verify after install):
+  SHA-256: ${fp}
+
+${CYAN}-- macOS --${NC}
+  Download and trust (run on your Mac, replace IP if needed):
+    scp root@<PAPER-PRO-IP>:${TLS_CERT} /tmp/rmpp-cert.pem
+    sudo security add-trusted-cert -d -r trustRoot \\
+      -k /Library/Keychains/System.keychain /tmp/rmpp-cert.pem
+  Remove later:
+    sudo security delete-certificate -c 'reMarkable Paper Pro (${HOSTNAME:-$(hostname 2>/dev/null)})' \\
+      /Library/Keychains/System.keychain
+
+${CYAN}-- Linux (Debian/Ubuntu) --${NC}
+    scp root@<PAPER-PRO-IP>:${TLS_CERT} /tmp/rmpp-cert.pem
+    sudo cp /tmp/rmpp-cert.pem /usr/local/share/ca-certificates/rmpp.crt
+    sudo update-ca-certificates
+
+${CYAN}-- Linux (Fedora/RHEL) --${NC}
+    scp root@<PAPER-PRO-IP>:${TLS_CERT} /tmp/rmpp-cert.pem
+    sudo cp /tmp/rmpp-cert.pem /etc/pki/ca-trust/source/anchors/rmpp.crt
+    sudo update-ca-trust
+
+${CYAN}-- Windows (PowerShell, admin) --${NC}
+    scp root@<PAPER-PRO-IP>:${TLS_CERT} \$env:TEMP\\rmpp-cert.pem
+    Import-Certificate -FilePath "\$env:TEMP\\rmpp-cert.pem" \`
+      -CertStoreLocation Cert:\\LocalMachine\\Root
+
+${CYAN}-- iOS / iPadOS --${NC}
+  AirDrop or email \`${TLS_CERT}\` to yourself, open it, then:
+    Settings -> General -> VPN & Device Management -> install the profile
+    Settings -> General -> About -> Certificate Trust Settings -> enable
+
+${YELLOW}Always verify the fingerprint above matches what \`webinterface-rmpp show-cert\`${NC}
+${YELLOW}prints before trusting the certificate.${NC}
+EOF
+}
+
+cmd_restart_wifi() {
+	require_root
+	systemctl restart webinterface-wifi.service
+	echo "restarted webinterface-wifi.service"
+}
+
+cmd_set_wifi_port() {
+	require_root
+	local port="${1:-}"
+	case "$port" in
+		''|*[!0-9]*) err "usage: webinterface-rmpp set-wifi-port <port>"; exit 2;;
+	esac
+	if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+		err "port out of range 1..65535"; exit 2
+	fi
+	if [ ! -f "$WIFI_ENV" ]; then
+		err "${RED}error:${NC} ${WIFI_ENV} missing -- run install.sh"
+		exit 1
+	fi
+	# Rewrite LISTEN_ADDR in the env file. /home is writable.
+	if grep -q '^LISTEN_ADDR=' "$WIFI_ENV"; then
+		sed -i -E "s|^LISTEN_ADDR=.*|LISTEN_ADDR=:${port}|" "$WIFI_ENV"
+	else
+		echo "LISTEN_ADDR=:${port}" >> "$WIFI_ENV"
+	fi
+	if systemctl --quiet is-active webinterface-wifi.service 2>/dev/null; then
+		systemctl restart webinterface-wifi.service
+	fi
+	echo "wifi proxy port set to ${port}"
+}
+
+cmd_set_wifi_auth() {
+	require_root
+	mkdir -p "$(dirname "$WIFI_ENV")"
+	# Username
+	local user="${1:-}"
+	if [ -z "$user" ]; then
+		printf 'username [admin]: '
+		read -r user
+		[ -z "$user" ] && user='admin'
+	fi
+	# Password (hidden) -- optional 2nd positional argument
+	local pass="${2:-}"
+	if [ -z "$pass" ]; then
+		printf 'password (input hidden): '
+		stty -echo 2>/dev/null
+		read -r pass
+		stty echo 2>/dev/null
+		printf '\n'
+		if [ -z "$pass" ]; then
+			err "password is required"
+			exit 2
+		fi
+		printf 'confirm: '
+		stty -echo 2>/dev/null
+		read -r pass2
+		stty echo 2>/dev/null
+		printf '\n'
+		if [ "$pass" != "$pass2" ]; then
+			err "passwords do not match"
+			exit 2
+		fi
+	fi
+	# Preserve existing LISTEN_ADDR / TARGET if present.
+	local listen target
+	listen=$(env_get LISTEN_ADDR); listen=${listen:-:443}
+	target=$(env_get TARGET);      target=${target:-10.11.99.1:80}
+	{
+		echo "# webinterface-rmpp wifi proxy env -- mode 0600"
+		echo "LISTEN_ADDR=${listen}"
+		echo "TARGET=${target}"
+		echo "AUTH_USER=${user}"
+		echo "AUTH_PASS=${pass}"
+	} > "$WIFI_ENV"
+	chmod 0600 "$WIFI_ENV"
+	echo "credentials written to ${WIFI_ENV}"
+	if systemctl --quiet is-active webinterface-wifi.service 2>/dev/null; then
+		systemctl restart webinterface-wifi.service
+		echo "proxy restarted"
+	fi
+}
+
+cmd_show_wifi_auth() {
+	if [ ! -f "$WIFI_ENV" ]; then echo "<not configured>"; exit 1; fi
+	user=$(env_get AUTH_USER)
+	pass=$(env_get AUTH_PASS)
+	echo "user:    ${user:-<unset>}"
+	echo "password: $([ -n "$pass" ] && echo '<set>' || echo '<unset>')"
+}
+
+cmd_is_alwayson()    { [ -f "$NETWORKD_DROPIN" ] && exit 0 || exit 1; }
+cmd_is_wifi_enabled() {
+	systemctl --quiet is-enabled webinterface-wifi.service 2>/dev/null \
+		&& exit 0 || exit 1
+}
+
+# --- dispatch ------------------------------------------------------------
+case "${1:-help}" in
+	status|-s|--status) shift; cmd_status "$@" ;;
+	ensure)             shift; cmd_ensure "$@" ;;
+	enable-wifi)        shift; cmd_enable_wifi "$@" ;;
+	disable-wifi)       shift; cmd_disable_wifi "$@" ;;
+	restart-wifi)       shift; cmd_restart_wifi "$@" ;;
+	set-wifi-port)      shift; cmd_set_wifi_port "$@" ;;
+	set-wifi-auth)      shift; cmd_set_wifi_auth "$@" ;;
+	show-wifi-auth)     shift; cmd_show_wifi_auth "$@" ;;
+	regen-cert)         shift; cmd_regen_cert "$@" ;;
+	show-cert)          shift; cmd_show_cert "$@" ;;
+	logs)               shift; cmd_logs "$@" ;;
+	diag)               shift; cmd_diag "$@" ;;
+	print-trust-snippet|trust-snippet) shift; cmd_print_trust_snippet "$@" ;;
+	is-alwayson)        shift; cmd_is_alwayson "$@" ;;
+	is-wifi-enabled)    shift; cmd_is_wifi_enabled "$@" ;;
+	version|--version)  cmd_version ;;
+	help|-h|--help|'')  cmd_help ;;
+	*) err "unknown command: $1"; cmd_help; exit 2 ;;
+esac

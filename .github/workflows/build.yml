@@ -1,0 +1,77 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write  # needed for softprops/action-gh-release on tag pushes
+
+jobs:
+  build:
+    name: cross-compile + package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache-dependency-path: proxy/go.sum
+          # cache-dependency-path is fine if go.sum is missing -- the
+          # action just skips the cache key for it.
+
+      - name: go vet
+        working-directory: proxy
+        run: go vet ./...
+
+      - name: bash -n on every script
+        run: |
+          for f in build.sh install.sh uninstall.sh webinterface-rmpp; do
+            echo "syntax-check: $f"
+            bash -n "$f"
+          done
+
+      - name: Build (cross-compile + tarball)
+        run: bash build.sh
+
+      - name: Verify built binary is aarch64 ELF
+        run: |
+          file bin/webinterface-wifi-proxy
+          file bin/webinterface-wifi-proxy | grep -q 'ARM aarch64'
+
+      - name: Compute artifact name
+        id: meta
+        run: |
+          tarball=$(ls dist/webinterface-rmpp-*.tar.gz | head -n 1)
+          version=$(basename "$tarball" .tar.gz | sed 's/^webinterface-rmpp-//')
+          echo "tarball=${tarball}"   >> "$GITHUB_OUTPUT"
+          echo "version=${version}"   >> "$GITHUB_OUTPUT"
+          echo "::notice::built ${tarball} (version ${version})"
+
+      - name: Upload tarball as CI artifact (every build)
+        uses: actions/upload-artifact@v4
+        with:
+          name: webinterface-rmpp-${{ steps.meta.outputs.version }}
+          path: |
+            dist/webinterface-rmpp-*.tar.gz
+            dist/webinterface-rmpp-*/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release (only on tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/webinterface-rmpp-*.tar.gz
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          # Body comes from auto-generated release notes; you can add
+          # extra text by editing the draft after the workflow runs.

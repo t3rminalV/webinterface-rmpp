@@ -1,0 +1,112 @@
+name: release
+
+# Bump the version across all source files, commit, tag, push.
+# Pushing the tag triggers .github/workflows/build.yml which creates the
+# actual GitHub Release with the .tar.gz attached.
+#
+# Run via the "Run workflow" button on the Actions tab.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'How to bump (ignored if version is set)'
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      version:
+        description: 'Explicit version, e.g. 0.6.0 (overrides bump). No v prefix.'
+        type: string
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  # Two release runs at once would race on the version file.
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so we can see existing tags.
+          fetch-depth: 0
+          # Default token; permissions.contents=write covers push + tag.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute new version
+        id: ver
+        env:
+          # Pass inputs via env to avoid shell-injection from interpolations.
+          BUMP: ${{ inputs.bump }}
+          OVERRIDE: ${{ inputs.version }}
+        run: |
+          set -eu
+          if [ -n "${OVERRIDE}" ]; then
+            new="${OVERRIDE}"
+          else
+            current=$(cat VERSION)
+            # Parse semver via parameter expansion -- no heredoc, no awk.
+            MA="${current%%.*}"
+            rest="${current#*.}"
+            MI="${rest%%.*}"
+            PA="${rest#*.}"
+            case "${BUMP}" in
+              patch) PA=$((PA+1)) ;;
+              minor) MI=$((MI+1)); PA=0 ;;
+              major) MA=$((MA+1)); MI=0; PA=0 ;;
+              *) echo "::error::unknown bump=${BUMP}"; exit 1 ;;
+            esac
+            new="${MA}.${MI}.${PA}"
+          fi
+          # Validate semver-ish (x.y.z, digits only).
+          case "$new" in
+            *[!0-9.]*|*..*|.*|*.|*.*.*.*) echo "::error::bad version: $new"; exit 1 ;;
+          esac
+          if ! echo "$new" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::bad version: $new"; exit 1
+          fi
+          # Don't re-release an existing tag.
+          if git rev-parse -q --verify "refs/tags/v${new}" >/dev/null; then
+            echo "::error::tag v${new} already exists"; exit 1
+          fi
+          echo "new=${new}" >> "$GITHUB_OUTPUT"
+          echo "::notice::bumping to v${new}"
+
+      - name: Rewrite version strings
+        env:
+          NEW: ${{ steps.ver.outputs.new }}
+        run: |
+          set -eu
+          echo "$NEW" > VERSION
+          sed -i "s/^const version = \".*\"/const version = \"${NEW}\"/" proxy/main.go
+          sed -i "s/^WEBINT_RMPP_VERSION='.*'/WEBINT_RMPP_VERSION='${NEW}'/" install.sh webinterface-rmpp
+
+          # Sanity: every file should now show $NEW.
+          grep -H '^const version'       proxy/main.go
+          grep -H '^WEBINT_RMPP_VERSION' install.sh webinterface-rmpp
+          echo "VERSION = $(cat VERSION)"
+
+      - name: Commit, tag, push
+        env:
+          NEW: ${{ steps.ver.outputs.new }}
+        run: |
+          set -eu
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add VERSION proxy/main.go install.sh webinterface-rmpp
+          if git diff --cached --quiet; then
+            echo "::warning::no version-string changes to commit"
+            exit 0
+          fi
+          git commit -m "release: v${NEW}"
+          git tag -a "v${NEW}" -m "v${NEW}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git push origin "v${NEW}"
+          echo "::notice::pushed; build.yml will publish the release shortly"

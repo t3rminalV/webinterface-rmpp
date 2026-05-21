@@ -1,0 +1,32 @@
+[Unit]
+Description=Proxy reMarkable USB web interface onto wifi (with basic auth)
+Documentation=https://github.com/local/webinterface-rmpp
+After=network-online.target
+Wants=xochitl.service
+
+[Service]
+Type=simple
+EnvironmentFile=/home/root/.config/webinterface-rmpp/wifi.env
+ExecStart=/home/root/.local/bin/webinterface-wifi-proxy
+Restart=on-failure
+RestartSec=3s
+
+# Hardening -- the proxy reads its env file + TLS cert/key (both under
+# /home/root/.config/webinterface-rmpp), listens on a TCP port, and
+# forwards to 10.11.99.1:80. Nothing else needed.
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+NoNewPrivileges=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

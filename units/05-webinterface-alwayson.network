@@ -1,0 +1,37 @@
+# Installed by webinterface-rmpp.
+#
+# Keeps 10.11.99.1 assigned to usb1 regardless of whether a USB cable is
+# connected to a host. Without this, systemd-networkd tears the address
+# down on carrier loss and xochitl drops the USB web interface.
+#
+# Sorts BEFORE the stock /etc/systemd/network/10-usb.network and matches
+# only usb1, so usb0 keeps the stock behaviour for cable-connected hosts.
+#
+# Settings replicated from 10-usb.network's [Network] are intentional:
+# .network files do NOT merge across matches -- the first matching file
+# wins entirely, so anything we want preserved must be repeated here.
+
+[Match]
+Name=usb1
+
+[Link]
+RequiredForOnline=no
+
+[Network]
+Address=10.11.99.1/27
+ConfigureWithoutCarrier=yes
+IgnoreCarrierLoss=yes
+KeepConfiguration=yes
+DHCPServer=yes
+MulticastDNS=resolve
+
+# DHCPServer settings replicated from the stock 10-usb.network. Required:
+# without them the host gets no DHCP lease on the cable and SSH-over-USB
+# to 10.11.99.1 stops working. Found this out the hard way.
+[DHCPServer]
+PoolSize=16
+DefaultLeaseTimeSec=60
+MaxLeaseTimeSec=60
+EmitDNS=no
+EmitNTP=no
+EmitRouter=no
